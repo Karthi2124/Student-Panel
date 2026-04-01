@@ -1,7 +1,7 @@
 <?php
 // programming_platform.php
 error_reporting(E_ALL);
-ini_set('display_errors', 0); // Don't display errors in output
+ini_set('display_errors', 0);
 
 if (session_status() === PHP_SESSION_NONE) {
     session_start();
@@ -10,47 +10,51 @@ if (session_status() === PHP_SESSION_NONE) {
 require_once __DIR__ . '/../../config/database.php';
 require_once __DIR__ . '/../../config/config.php';
 
-// Check login - support both user_id and student_id
+$success_message = '';
+$error_message = '';
+$selected_lab = null;
+$questions = [];
+$answers = [];
+$labs = [];
+$user = null;
+$current_question = null;
+$current_answer = null;
+
 $userId = $_SESSION['user_id'] ?? $_SESSION['student_id'] ?? null;
 if (!$userId) {
     header("Location: login.php");
     exit;
 }
 
-// Get user info
-$stmtUser = $pdo->prepare("SELECT id, full_name, department, role FROM users WHERE id = ?");
-$stmtUser->execute([$userId]);
-$user = $stmtUser->fetch();
-
-if (!$user) {
-    $stmtStudent = $pdo->prepare("SELECT id, full_name, department FROM students WHERE id = ?");
-    $stmtStudent->execute([$userId]);
-    $user = $stmtStudent->fetch();
-}
-
-if (!$user) {
-    die("User not found.");
+try {
+    $stmtUser = $pdo->prepare("SELECT id, full_name, department, role FROM users WHERE id = ?");
+    $stmtUser->execute([$userId]);
+    $user = $stmtUser->fetch();
+    if (!$user) {
+        $stmtStudent = $pdo->prepare("SELECT id, full_name, department FROM students WHERE id = ?");
+        $stmtStudent->execute([$userId]);
+        $user = $stmtStudent->fetch();
+    }
+    if (!$user) die("User not found.");
+} catch (PDOException $e) {
+    error_log("Database error: " . $e->getMessage());
+    die("Database error occurred.");
 }
 
 // Handle AI code review
 if (isset($_POST['ai_review'])) {
+    ob_clean(); // ✅ ADD THIS LINE
     header('Content-Type: application/json');
     try {
         $code = $_POST['code'];
         $language = $_POST['language'];
         $question_id = $_POST['question_id'];
         $runOutput = $_POST['run_output'] ?? '';
-        
         $stmt = $pdo->prepare("SELECT * FROM programming_questions WHERE id = ?");
         $stmt->execute([$question_id]);
         $question = $stmt->fetch();
-        
-        if (!$question) {
-            throw new Exception("Question not found");
-        }
-        
+        if (!$question) throw new Exception("Question not found");
         $review = getAIAutoReview($code, $language, $runOutput, $question);
-        
         echo json_encode(['success' => true, 'review' => $review]);
     } catch (Exception $e) {
         echo json_encode(['success' => false, 'error' => $e->getMessage()]);
@@ -60,13 +64,12 @@ if (isset($_POST['ai_review'])) {
 
 // Handle code execution
 if (isset($_POST['execute_code'])) {
+    ob_clean(); // ✅ ADD THIS LINE
     header('Content-Type: application/json');
     try {
         $code = $_POST['code'];
         $language = $_POST['language'];
-        
         $result = executeCode($code, $language);
-        
         echo json_encode(['success' => true, 'output' => $result]);
     } catch (Exception $e) {
         echo json_encode(['success' => false, 'error' => $e->getMessage()]);
@@ -74,26 +77,21 @@ if (isset($_POST['execute_code'])) {
     exit;
 }
 
-// Handle answer submission with code
+// Handle answer submission
 if (isset($_POST['submit_programming_answer'])) {
     try {
         $question_id = $_POST['question_id'];
         $lab_id = $_POST['lab_id'];
         $code = $_POST['code'];
         $language = $_POST['language'];
-        
         $stmt = $pdo->prepare("SELECT * FROM programming_questions WHERE id = ?");
         $stmt->execute([$question_id]);
         $question = $stmt->fetch();
-        
-        if (!$question) {
-            throw new Exception("Question not found");
-        }
+        if (!$question) throw new Exception("Question not found");
         
         $checkStmt = $pdo->prepare("SELECT * FROM student_programming_answers WHERE question_id = ? AND student_id = ?");
         $checkStmt->execute([$question_id, $userId]);
         $existing = $checkStmt->fetch();
-        
         if ($existing) {
             $_SESSION['error_message'] = "You have already answered this question.";
             header("Location: index.php?page=programming_platform&lab=" . $lab_id);
@@ -102,69 +100,34 @@ if (isset($_POST['submit_programming_answer'])) {
         
         $test_results = runTestCases($code, $language, $question);
         $total_tests = count($test_results['tests']);
-        $passed_tests = count(array_filter($test_results['tests'], function($test) {
-            return $test['passed'];
-        }));
-        
+        $passed_tests = count(array_filter($test_results['tests'], function($test) { return $test['passed']; }));
         $score = $total_tests > 0 ? ($passed_tests / $total_tests) * 100 : 0;
         $is_correct = $score >= 70;
+        $ai_feedback = $is_correct ? getAIFeedback($code, $language, $question, $test_results) : getAIImprovement($code, $language, $question, $test_results);
         
-        $ai_feedback = null;
-        if ($is_correct) {
-            $ai_feedback = getAIFeedback($code, $language, $question, $test_results);
-        } else {
-            $ai_feedback = getAIImprovement($code, $language, $question, $test_results);
-        }
-        
-        $insertStmt = $pdo->prepare("
-            INSERT INTO student_programming_answers 
-            (question_id, student_id, code, language, test_results, passed_tests, total_tests, score, is_correct, ai_feedback, submitted_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
-        ");
-        
-        $insertStmt->execute([
-            $question_id,
-            $userId,
-            $code,
-            $language,
-            json_encode($test_results),
-            $passed_tests,
-            $total_tests,
-            $score,
-            $is_correct ? 1 : 0,
-            $ai_feedback
-        ]);
+        $insertStmt = $pdo->prepare("INSERT INTO student_programming_answers (question_id, student_id, code, language, test_results, passed_tests, total_tests, score, is_correct, ai_feedback, submitted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())");
+        $insertStmt->execute([$question_id, $userId, $code, $language, json_encode($test_results), $passed_tests, $total_tests, $score, $is_correct ? 1 : 0, $ai_feedback]);
         
         updateProgrammingLabProgress($pdo, $lab_id, $userId);
-        
         $_SESSION['success_message'] = "Code submitted successfully! Passed $passed_tests/$total_tests tests.";
         header("Location: index.php?page=programming_platform&lab=" . $lab_id);
         exit;
-        
     } catch (Exception $e) {
         $_SESSION['error_message'] = "Error: " . $e->getMessage();
-        header("Location: index.php?page=programming_platform&lab=" . $lab_id);
+        header("Location: index.php?page=programming_platform&lab=" . ($_POST['lab_id'] ?? ''));
         exit;
     }
 }
 
-// AI Review Function with Run Output
 function getAIAutoReview($code, $language, $runOutput, $question) {
     try {
-        $apiKey = defined('NVIDIA_API_KEY') ? NVIDIA_API_KEY : (defined('OPENAI_API_KEY') ? OPENAI_API_KEY : '');
-        
-        if (empty($apiKey)) {
-            return "AI review is not available. Please configure your API key.";
-        }
+        $apiKey = NVIDIA_API_KEY;
+        if (empty($apiKey)) return "AI review is not available.";
         
         $prompt = "You are an expert programming instructor reviewing a student's code in real time.\n\n";
         $prompt .= "### Problem\nTitle: " . $question['title'] . "\nDescription: " . $question['description'] . "\n\n";
         $prompt .= "### Student Code (" . $language . ")\n```" . $language . "\n" . $code . "\n```\n\n";
-        
-        if (trim($runOutput) !== '') {
-            $prompt .= "### Actual Output\n```\n" . $runOutput . "\n```\n\n";
-        }
-        
+        if (trim($runOutput) !== '') $prompt .= "### Actual Output\n```\n" . $runOutput . "\n```\n\n";
         $prompt .= "### Instructions\nProvide a concise, structured review with exactly these 4 sections:\n";
         $prompt .= "1. **What's Working** - what the student got right\n";
         $prompt .= "2. **Issues Found** - bugs or logic errors with line references\n";
@@ -172,9 +135,7 @@ function getAIAutoReview($code, $language, $runOutput, $question) {
         $prompt .= "4. **Edge Cases** - inputs that could break this code\n";
         $prompt .= "Max 400 words. Plain text only.";
         
-        $response = callAIAPI($prompt, $apiKey);
-        return $response;
-        
+        return callNVIDIAAPI($prompt, $apiKey);
     } catch (Exception $e) {
         return "AI review temporarily unavailable: " . $e->getMessage();
     }
@@ -182,25 +143,16 @@ function getAIAutoReview($code, $language, $runOutput, $question) {
 
 function getAIFeedback($code, $language, $question, $test_results) {
     try {
-        $apiKey = defined('NVIDIA_API_KEY') ? NVIDIA_API_KEY : (defined('OPENAI_API_KEY') ? OPENAI_API_KEY : '');
+        $apiKey = NVIDIA_API_KEY;
+        if (empty($apiKey)) return "Great job! Your solution passes the test cases.";
         
-        if (empty($apiKey)) {
-            return "Great job! Your solution passes the test cases.";
-        }
-        
-        $passed_tests = count(array_filter($test_results['tests'], function($test) {
-            return $test['passed'];
-        }));
+        $passed_tests = count(array_filter($test_results['tests'], function($test) { return $test['passed']; }));
         $total_tests = count($test_results['tests']);
-        
         $prompt = "You are a programming instructor. The student solved a problem correctly ($passed_tests/$total_tests tests passed).\n\n";
-        $prompt .= "Question: " . $question['title'] . "\n";
-        $prompt .= "Code:\n```" . $language . "\n" . $code . "\n```\n\n";
+        $prompt .= "Question: " . $question['title'] . "\nCode:\n```" . $language . "\n" . $code . "\n```\n\n";
         $prompt .= "Give encouraging feedback, highlight strengths, and suggest any alternative approaches. Max 250 words.";
         
-        $response = callAIAPI($prompt, $apiKey);
-        return $response;
-        
+        return callNVIDIAAPI($prompt, $apiKey);
     } catch (Exception $e) {
         return "Excellent work! Your solution passed all test cases!";
     }
@@ -208,60 +160,26 @@ function getAIFeedback($code, $language, $question, $test_results) {
 
 function getAIImprovement($code, $language, $question, $test_results) {
     try {
-        $apiKey = defined('NVIDIA_API_KEY') ? NVIDIA_API_KEY : (defined('OPENAI_API_KEY') ? OPENAI_API_KEY : '');
+        $apiKey = NVIDIA_API_KEY;
+        if (empty($apiKey)) return "Your solution did not pass all test cases. Review your logic and try again.";
         
-        if (empty($apiKey)) {
-            return "Your solution did not pass all test cases. Review your logic and try again.";
-        }
-        
-        $failed_tests = array_filter($test_results['tests'], function($test) {
-            return !$test['passed'];
-        });
-        
-        $prompt = "You are a programming instructor. The student's solution has issues.\n\n";
-        $prompt .= "Question: " . $question['title'] . "\n";
-        $prompt .= "Description: " . $question['description'] . "\n\n";
-        $prompt .= "Code:\n```" . $language . "\n" . $code . "\n```\n\n";
-        $prompt .= "Failed Tests:\n";
-        foreach ($failed_tests as $test) {
-            $prompt .= "- Input: {$test['input']}, Expected: {$test['expected']}, Got: {$test['actual']}\n";
-        }
+        $failed_tests = array_filter($test_results['tests'], function($test) { return !$test['passed']; });
+        $prompt = "You are a programming instructor. The student's solution has issues.\n\nQuestion: " . $question['title'] . "\nDescription: " . $question['description'] . "\n\nCode:\n```" . $language . "\n" . $code . "\n```\n\nFailed Tests:\n";
+        foreach ($failed_tests as $test) $prompt .= "- Input: {$test['input']}, Expected: {$test['expected']}, Got: {$test['actual']}\n";
         $prompt .= "\nGive constructive hints - no complete solutions. Max 350 words.";
         
-        $response = callAIAPI($prompt, $apiKey);
-        return $response;
-        
+        return callNVIDIAAPI($prompt, $apiKey);
     } catch (Exception $e) {
-        $failed = count(array_filter($test_results['tests'], function($test) {
-            return !$test['passed'];
-        }));
+        $failed = count(array_filter($test_results['tests'], function($test) { return !$test['passed']; }));
         return "Your solution did not pass $failed test case(s). Check your logic and try again.";
     }
 }
 
-function callAIAPI($prompt, $apiKey) {
-    if (defined('NVIDIA_API_KEY') && !empty(NVIDIA_API_KEY)) {
-        return callNVIDIAAPI($prompt, $apiKey);
-    }
-    
-    if (defined('OPENAI_API_KEY') && !empty(OPENAI_API_KEY)) {
-        return callOpenAIAPI($prompt, $apiKey);
-    }
-    
-    throw new Exception("No valid API key configured");
-}
-
 function callNVIDIAAPI($prompt, $apiKey) {
     $url = "https://integrate.api.nvidia.com/v1/chat/completions";
-    
     $data = [
         "model" => "meta/llama-3.1-8b-instruct",
-        "messages" => [
-            [
-                "role" => "user",
-                "content" => $prompt
-            ]
-        ],
+        "messages" => [["role" => "user", "content" => $prompt]],
         "temperature" => 0.6,
         "max_tokens" => 900,
         "top_p" => 0.95
@@ -279,122 +197,96 @@ function callNVIDIAAPI($prompt, $apiKey) {
     
     $response = curl_exec($ch);
     $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curlError = curl_error($ch);
     curl_close($ch);
     
+    if ($curlError) {
+        throw new Exception("CURL error: " . $curlError);
+    }
+    
     if ($httpCode !== 200) {
-        throw new Exception("NVIDIA API error: HTTP $httpCode");
+        throw new Exception("API error: HTTP $httpCode");
     }
     
     $result = json_decode($response, true);
-    
-    if (isset($result['choices'][0]['message']['content'])) {
-        return $result['choices'][0]['message']['content'];
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        throw new Exception("Invalid JSON response");
     }
     
-    throw new Exception("Invalid response from NVIDIA API");
-}
-
-function callOpenAIAPI($prompt, $apiKey) {
-    $url = "https://api.openai.com/v1/chat/completions";
-    
-    $data = [
-        "model" => "gpt-3.5-turbo",
-        "messages" => [
-            [
-                "role" => "system",
-                "content" => "You are a helpful programming instructor."
-            ],
-            [
-                "role" => "user",
-                "content" => $prompt
-            ]
-        ],
-        "temperature" => 0.7,
-        "max_tokens" => 800
-    ];
-    
-    $ch = curl_init($url);
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_POST, true);
-    curl_setopt($ch, CURLOPT_HTTPHEADER, [
-        "Authorization: Bearer " . $apiKey,
-        "Content-Type: application/json"
-    ]);
-    curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
-    curl_setopt($ch, CURLOPT_TIMEOUT, 30);
-    
-    $response = curl_exec($ch);
-    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    curl_close($ch);
-    
-    if ($httpCode !== 200) {
-        throw new Exception("OpenAI API error: HTTP $httpCode");
+    if (!isset($result['choices'][0]['message']['content'])) {
+        throw new Exception("Unexpected API response structure");
     }
     
-    $result = json_decode($response, true);
-    
-    if (isset($result['choices'][0]['message']['content'])) {
-        return $result['choices'][0]['message']['content'];
-    }
-    
-    throw new Exception("Invalid response from OpenAI API");
+    return $result['choices'][0]['message']['content'];
 }
 
 function executeCode($code, $language) {
-    $tmpDir = sys_get_temp_dir() . '/code_exec_' . uniqid();
-    mkdir($tmpDir, 0700, true);
+    $tmpDir = __DIR__ . '/tmp/code_exec_' . uniqid();
+    mkdir($tmpDir, 0777, true);
     $timeout = 5;
     
+    // Security: block dangerous functions
     $code = preg_replace('/\b(exec|shell_exec|system|passthru|popen|proc_open)\s*\(/i', "//blocked_$1(", $code);
     $code = preg_replace('/`.*?`/s', '"blocked_backtick"', $code);
+    
+    $filename = '';
+    $command = '';
     
     switch($language) {
         case 'python':
             $filename = $tmpDir . '/script.py';
             file_put_contents($filename, $code);
-            $command = "timeout $timeout python3 $filename 2>&1";
+            chmod($filename, 0777); // ✅ allow execution
+            $command = "python3 {$filename} 2>&1";
             break;
+            
         case 'javascript':
             $filename = $tmpDir . '/script.js';
             file_put_contents($filename, $code);
-            $command = "timeout $timeout node $filename 2>&1";
+            $command = "node {$filename} 2>&1";
             break;
+            
         case 'php':
             $filename = $tmpDir . '/script.php';
-            file_put_contents($filename, "<?php\n" . $code . "\n?>");
-            $command = "timeout $timeout php $filename 2>&1";
+            file_put_contents($filename, $code);
+            $command = "php {$filename} 2>&1";
             break;
+            
         default:
             cleanupDir($tmpDir);
-            return "Supported languages: Python, JavaScript, PHP";
+            return "Unsupported language: " . $language;
     }
     
+    // Execute the command
+    $output = [];
+    $return_var = 0;
     exec($command, $output, $return_var);
-    $result = implode("\n", $output);
+    
+    // Clean up
     cleanupDir($tmpDir);
     
-    if ($return_var === 124) return "Execution timed out (5s limit)";
+    // Check for timeout
+    if ($return_var === 124) {
+        return "Execution timed out ({$timeout}s limit)";
+    }
+    
+    $result = implode("\n", $output);
     return $result !== '' ? $result : '(no output)';
 }
 
 function cleanupDir($dir) {
-    if (is_dir($dir)) {
-        $files = glob($dir . '/*');
+    if (is_dir($dir)) { 
+        $files = glob($dir . '/*'); 
         foreach ($files as $file) {
-            if (is_file($file)) {
-                unlink($file);
-            }
+            if (is_file($file)) unlink($file);
         }
-        rmdir($dir);
+        rmdir($dir); 
     }
 }
 
 function runTestCases($code, $language, $question) {
     $test_cases = json_decode($question['test_cases'], true);
-    if (!$test_cases) {
-        $test_cases = [];
-    }
-    
+    if (!$test_cases) $test_cases = [];
     $results = ['tests' => []];
     
     foreach ($test_cases as $index => $test) {
@@ -402,17 +294,17 @@ function runTestCases($code, $language, $question) {
         $output = executeCode($test_code, $language);
         $expected = trim($test['expected_output']);
         $actual = trim($output);
-        
         $passed = strcasecmp($actual, $expected) === 0;
+        
         if (!$passed && is_numeric($actual) && is_numeric($expected)) {
             $passed = abs(floatval($actual) - floatval($expected)) < 1e-9;
         }
         
         $results['tests'][] = [
-            'test_number' => $index + 1,
-            'input' => $test['input'],
-            'expected' => $expected,
-            'actual' => $actual,
+            'test_number' => $index + 1, 
+            'input' => $test['input'], 
+            'expected' => $expected, 
+            'actual' => $actual, 
             'passed' => $passed
         ];
     }
@@ -423,17 +315,18 @@ function runTestCases($code, $language, $question) {
 function prepareCodeWithTest($code, $language, $test) {
     $input = $test['input'];
     
+    // Remove print/echo statements that might interfere with testing
     $code = preg_replace('/print\s*\(.*\)\s*;?/m', '', $code);
     $code = preg_replace('/console\.log\s*\(.*\)\s*;?/m', '', $code);
     $code = preg_replace('/echo\s+.*;?/m', '', $code);
     
     switch($language) {
         case 'python':
-            return $code . "\nprint(" . $input . ")";
+            return $code . "\n\n# Test case\nprint(solution(" . $input . "))";
         case 'javascript':
-            return $code . "\nconsole.log(" . $input . ");";
+            return $code . "\n\n// Test case\nconsole.log(solution(" . $input . "));";
         case 'php':
-            return $code . "\necho " . $input . ";";
+            return $code . "\n\n// Test case\necho solution(" . $input . ");";
         default:
             return $code;
     }
@@ -444,12 +337,7 @@ function updateProgrammingLabProgress($pdo, $lab_id, $student_id) {
     $totalStmt->execute([$lab_id]);
     $total_questions = $totalStmt->fetchColumn();
     
-    $answeredStmt = $pdo->prepare("
-        SELECT COUNT(DISTINCT question_id) 
-        FROM student_programming_answers 
-        WHERE question_id IN (SELECT id FROM programming_questions WHERE lab_id = ?) 
-        AND student_id = ?
-    ");
+    $answeredStmt = $pdo->prepare("SELECT COUNT(DISTINCT question_id) FROM student_programming_answers WHERE question_id IN (SELECT id FROM programming_questions WHERE lab_id = ?) AND student_id = ?");
     $answeredStmt->execute([$lab_id, $student_id]);
     $answered_questions = $answeredStmt->fetchColumn();
     
@@ -460,19 +348,10 @@ function updateProgrammingLabProgress($pdo, $lab_id, $student_id) {
     $existing = $checkStmt->fetch();
     
     if ($existing) {
-        $updateStmt = $pdo->prepare("
-            UPDATE student_programming_progress 
-            SET progress = ?, answered_questions = ?, last_activity = NOW(), 
-                status = CASE WHEN ? >= 100 THEN 'completed' ELSE 'in_progress' END
-            WHERE lab_id = ? AND student_id = ?
-        ");
+        $updateStmt = $pdo->prepare("UPDATE student_programming_progress SET progress = ?, answered_questions = ?, last_activity = NOW(), status = CASE WHEN ? >= 100 THEN 'completed' ELSE 'in_progress' END WHERE lab_id = ? AND student_id = ?");
         $updateStmt->execute([$progress, $answered_questions, $progress, $lab_id, $student_id]);
     } else {
-        $insertStmt = $pdo->prepare("
-            INSERT INTO student_programming_progress 
-            (lab_id, student_id, progress, answered_questions, total_questions, status, started_at, last_activity)
-            VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW())
-        ");
+        $insertStmt = $pdo->prepare("INSERT INTO student_programming_progress (lab_id, student_id, progress, answered_questions, total_questions, status, started_at, last_activity) VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW())");
         $status = $progress >= 100 ? 'completed' : 'in_progress';
         $insertStmt->execute([$lab_id, $student_id, $progress, $answered_questions, $total_questions, $status]);
     }
@@ -480,30 +359,16 @@ function updateProgrammingLabProgress($pdo, $lab_id, $student_id) {
 
 function getStarterCode($lang) {
     $starters = [
-        'python' => "# Write your solution here\n\ndef solution():\n    # your code here\n    pass\n\n# Example:\n# print(solution())\n",
-        'javascript' => "// Write your solution here\n\nfunction solution() {\n    // your code here\n}\n\n// console.log(solution());\n",
-        'php' => "<?php\n// Write your solution here\n\nfunction solution() {\n    // your code here\n}\n\n// echo solution();\n",
+        'python' => "# Write your solution here\n\ndef solution(a, b):\n    # your code here\n    return a + b\n\n# Example:\n# print(solution(5, 3))\n",
+        'javascript' => "// Write your solution here\n\nfunction solution(a, b) {\n    // your code here\n    return a + b;\n}\n\n// console.log(solution(5, 3));\n",
+        'php' => "<?php\n// Write your solution here\n\nfunction solution(\$a, \$b) {\n    // your code here\n    return \$a + \$b;\n}\n\n// echo solution(5, 3);\n",
     ];
     return $starters[$lang] ?? "# Write your code here\n";
 }
 
-// Get programming labs for student
+// Get programming labs
 try {
-    $labsStmt = $pdo->prepare("
-        SELECT l.*, 
-               (SELECT COUNT(*) FROM programming_questions WHERE lab_id = l.id) as total_questions,
-               spp.progress, spp.status as progress_status, spp.answered_questions,
-               spp.last_activity
-        FROM programming_labs l
-        LEFT JOIN student_programming_progress spp ON l.id = spp.lab_id AND spp.student_id = ?
-        WHERE l.department = ? OR l.department IS NULL
-        ORDER BY 
-            CASE WHEN spp.status = 'in_progress' THEN 0 
-                 WHEN spp.status = 'not_started' THEN 1 
-                 ELSE 2 END,
-            spp.last_activity DESC,
-            l.created_at DESC
-    ");
+    $labsStmt = $pdo->prepare("SELECT l.*, (SELECT COUNT(*) FROM programming_questions WHERE lab_id = l.id) as total_questions, spp.progress, spp.status as progress_status, spp.answered_questions, spp.last_activity FROM programming_labs l LEFT JOIN student_programming_progress spp ON l.id = spp.lab_id AND spp.student_id = ? WHERE l.department = ? OR l.department IS NULL ORDER BY CASE WHEN spp.status = 'in_progress' THEN 0 WHEN spp.status = 'not_started' THEN 1 ELSE 2 END, spp.last_activity DESC, l.created_at DESC");
     $labsStmt->execute([$userId, $user['department'] ?? 'Computer Science']);
     $labs = $labsStmt->fetchAll();
 } catch (PDOException $e) {
@@ -517,56 +382,46 @@ $answers = [];
 $current_question = null;
 $current_answer = null;
 
+// Determine view mode
+$view_mode = 'dashboard';
+
 if (isset($_GET['lab'])) {
     $lab_id = $_GET['lab'];
-    
     $labStmt = $pdo->prepare("SELECT * FROM programming_labs WHERE id = ?");
     $labStmt->execute([$lab_id]);
     $selected_lab = $labStmt->fetch();
-    
+
     if ($selected_lab) {
-        $questionsStmt = $pdo->prepare("
-            SELECT * FROM programming_questions 
-            WHERE lab_id = ? 
-            ORDER BY 
-                CASE difficulty 
-                    WHEN 'easy' THEN 1 
-                    WHEN 'medium' THEN 2 
-                    WHEN 'hard' THEN 3 
-                END, 
-                created_at
-        ");
+        $questionsStmt = $pdo->prepare("SELECT * FROM programming_questions WHERE lab_id = ? ORDER BY CASE difficulty WHEN 'easy' THEN 1 WHEN 'medium' THEN 2 WHEN 'hard' THEN 3 END, created_at");
         $questionsStmt->execute([$lab_id]);
         $questions = $questionsStmt->fetchAll();
-        
+
         $question_ids = array_column($questions, 'id');
         if (!empty($question_ids)) {
             $placeholders = implode(',', array_fill(0, count($question_ids), '?'));
-            $answersStmt = $pdo->prepare("
-                SELECT * FROM student_programming_answers 
-                WHERE question_id IN ($placeholders) AND student_id = ?
-            ");
+            $answersStmt = $pdo->prepare("SELECT * FROM student_programming_answers WHERE question_id IN ($placeholders) AND student_id = ?");
             $params = array_merge($question_ids, [$userId]);
             $answersStmt->execute($params);
             $answers_data = $answersStmt->fetchAll();
-            
-            foreach ($answers_data as $answer) {
-                $answers[$answer['question_id']] = $answer;
-            }
+            foreach ($answers_data as $answer) $answers[$answer['question_id']] = $answer;
         }
-        
-        $selected_question_id = $_GET['question'] ?? ($questions[0]['id'] ?? 0);
-        foreach ($questions as $q) {
-            if ($q['id'] == $selected_question_id) {
-                $current_question = $q;
-                $current_answer = $answers[$q['id']] ?? null;
-                break;
+
+        if (isset($_GET['question'])) {
+            $view_mode = 'ide';
+            $selected_question_id = $_GET['question'];
+            foreach ($questions as $q) {
+                if ($q['id'] == $selected_question_id) {
+                    $current_question = $q;
+                    $current_answer = $answers[$q['id']] ?? null;
+                    break;
+                }
             }
-        }
-        
-        if (!$current_question && !empty($questions)) {
-            $current_question = $questions[0];
-            $current_answer = $answers[$questions[0]['id']] ?? null;
+            if (!$current_question && !empty($questions)) {
+                $current_question = $questions[0];
+                $current_answer = $answers[$questions[0]['id']] ?? null;
+            }
+        } else {
+            $view_mode = 'question_list';
         }
     }
 }
@@ -575,17 +430,17 @@ $success_message = $_SESSION['success_message'] ?? '';
 $error_message = $_SESSION['error_message'] ?? '';
 unset($_SESSION['success_message'], $_SESSION['error_message']);
 ?>
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Programming Platform</title>
-    <script src="https://cdn.tailwindcss.com"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>CodeLabs | Programming Platform</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/codemirror.min.css">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/theme/dracula.min.css">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/codemirror.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/mode/python/python.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/mode/javascript/javascript.min.js"></script>
@@ -596,19 +451,805 @@ unset($_SESSION['success_message'], $_SESSION['error_message']);
             padding: 0;
             box-sizing: border-box;
         }
-        
+
+        :root {
+            --bg: #ffffff;
+            --bg-secondary: #f9fafb;
+            --bg-tertiary: #f3f4f6;
+            --border: #e5e7eb;
+            --border-light: #f0f0f0;
+            --text-primary: #111827;
+            --text-secondary: #6b7280;
+            --text-muted: #9ca3af;
+            --accent: #2563eb;
+            --accent-hover: #1d4ed8;
+            --accent-light: #eff6ff;
+            --accent-border: #bfdbfe;
+            --green: #16a34a;
+            --green-bg: #f0fdf4;
+            --green-border: #bbf7d0;
+            --red: #dc2626;
+            --red-bg: #fef2f2;
+            --red-border: #fecaca;
+            --yellow: #d97706;
+            --yellow-bg: #fffbeb;
+            --yellow-border: #fde68a;
+            --radius-sm: 4px;
+            --radius: 8px;
+            --radius-lg: 12px;
+            --shadow-sm: 0 1px 2px rgba(0,0,0,0.05);
+            --shadow: 0 1px 3px rgba(0,0,0,0.1);
+            --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+        }
+
+        html, body {
+            height: 100%;
+            overflow: hidden;
+            width: 100%;
+            position: fixed;
+        }
+
         body {
-            background: #0f0f1a;
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', system-ui, sans-serif;
+            font-family: var(--font-sans);
+            background: var(--bg);
+            color: var(--text-primary);
+            line-height: 1.5;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: var(--bg-tertiary); border-radius: 99px; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 99px; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+
+        .topnav {
+            height: 52px;
+            border-bottom: 1px solid var(--border);
+            background: var(--bg);
+            display: flex;
+            align-items: center;
+            padding: 0 24px;
+            gap: 20px;
+            flex-shrink: 0;
         }
         
-        /* Flash Messages */
-        .flash-message {
+        .topnav-logo {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-weight: 700;
+            font-size: 16px;
+            color: var(--text-primary);
+            text-decoration: none;
+        }
+        
+        .topnav-logo .logo-icon {
+            width: 30px;
+            height: 30px;
+            background: var(--accent);
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-size: 14px;
+        }
+        
+        .topnav-divider {
+            width: 1px;
+            height: 24px;
+            background: var(--border);
+        }
+        
+        .topnav-breadcrumb {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 13px;
+            color: var(--text-secondary);
+            flex-wrap: nowrap;
+        }
+        
+        .topnav-breadcrumb a {
+            color: var(--text-secondary);
+            text-decoration: none;
+        }
+        
+        .topnav-breadcrumb a:hover {
+            color: var(--text-primary);
+        }
+        
+        .topnav-breadcrumb .current {
+            color: var(--text-primary);
+            font-weight: 500;
+        }
+        
+        .topnav-right {
+            margin-left: auto;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            flex-shrink: 0;
+        }
+        
+        .topnav-stat {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 12px;
+            color: var(--text-secondary);
+            background: var(--bg-tertiary);
+            padding: 4px 12px;
+            border-radius: 99px;
+        }
+        
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            font-size: 11px;
+            font-weight: 500;
+            padding: 2px 8px;
+            border-radius: 99px;
+        }
+        
+        .badge-easy { background: var(--green-bg); color: var(--green); }
+        .badge-medium { background: var(--yellow-bg); color: var(--yellow); }
+        .badge-hard { background: var(--red-bg); color: var(--red); }
+        .badge-lang { background: var(--accent-light); color: var(--accent); }
+        .badge-neutral { background: var(--bg-tertiary); color: var(--text-secondary); }
+
+        .dashboard-wrapper {
+            flex: 1;
+            overflow-y: auto;
+            overflow-x: hidden;
+        }
+        
+        .dashboard-hero {
+            padding: 32px 40px 24px;
+            border-bottom: 1px solid var(--border);
+            background: linear-gradient(135deg, #f8fafc 0%, #ffffff 100%);
+        }
+        
+        .dashboard-hero h1 {
+            font-size: 28px;
+            font-weight: 700;
+            margin-bottom: 6px;
+        }
+        
+        .dashboard-hero p {
+            font-size: 14px;
+            color: var(--text-secondary);
+        }
+        
+        .dashboard-stats {
+            display: flex;
+            gap: 16px;
+            margin-top: 24px;
+            flex-wrap: wrap;
+        }
+        
+        .stat-chip {
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 12px 20px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        
+        .stat-chip .stat-val {
+            font-size: 20px;
+            font-weight: 700;
+            line-height: 1;
+        }
+        
+        .stat-chip .stat-lbl {
+            font-size: 11px;
+            color: var(--text-muted);
+            margin-top: 2px;
+        }
+        
+        .dashboard-body {
+            padding: 32px 40px;
+        }
+        
+        .section-title {
+            font-size: 13px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-muted);
+            margin-bottom: 16px;
+        }
+        
+        .labs-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+            gap: 20px;
+        }
+        
+        .lab-card {
+            border: 1px solid var(--border);
+            border-radius: var(--radius-lg);
+            background: var(--bg);
+            padding: 20px;
+            transition: all 0.2s;
+            text-decoration: none;
+            color: inherit;
+            display: block;
+        }
+        
+        .lab-card:hover {
+            box-shadow: var(--shadow);
+            border-color: var(--accent-border);
+            transform: translateY(-2px);
+        }
+        
+        .lab-card-header {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            margin-bottom: 12px;
+        }
+        
+        .lab-card-icon {
+            width: 40px;
+            height: 40px;
+            background: var(--accent-light);
+            border-radius: var(--radius);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--accent);
+            font-size: 18px;
+        }
+        
+        .lab-card h3 {
+            font-size: 16px;
+            font-weight: 600;
+            margin-bottom: 6px;
+        }
+        
+        .lab-card p {
+            font-size: 12px;
+            color: var(--text-secondary);
+            line-height: 1.5;
+            margin-bottom: 16px;
+        }
+        
+        .progress-bar {
+            height: 4px;
+            background: var(--bg-tertiary);
+            border-radius: 99px;
+            overflow: hidden;
+            margin: 12px 0;
+        }
+        
+        .progress-bar-fill {
+            height: 100%;
+            background: var(--accent);
+            border-radius: 99px;
+            transition: width 0.3s;
+        }
+        
+        .lab-card-btn {
+            display: block;
+            width: 100%;
+            text-align: center;
+            padding: 8px;
+            border-radius: var(--radius-sm);
+            font-size: 13px;
+            font-weight: 500;
+            text-decoration: none;
+            transition: all 0.15s;
+            margin-top: 12px;
+        }
+        
+        .lab-card-btn.primary {
+            background: var(--accent);
+            color: white;
+        }
+        
+        .lab-card-btn.primary:hover {
+            background: var(--accent-hover);
+        }
+        
+        .lab-card-btn.secondary {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+        }
+
+        .qlist-wrapper {
+            flex: 1;
+            overflow-y: auto;
+            overflow-x: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .qlist-header {
+            padding: 24px 32px;
+            border-bottom: 1px solid var(--border);
+            background: var(--bg);
+        }
+        
+        .qlist-header h2 {
+            font-size: 22px;
+            font-weight: 700;
+            margin-bottom: 6px;
+        }
+        
+        .qlist-header p {
+            font-size: 13px;
+            color: var(--text-secondary);
+        }
+        
+        .qlist-body {
+            padding: 24px 32px;
+            flex: 1;
+            overflow-y: auto;
+        }
+        
+        .filter-row {
+            display: flex;
+            gap: 8px;
+            padding: 12px 0;
+            border-bottom: 1px solid var(--border-light);
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+        
+        .filter-btn {
+            padding: 6px 14px;
+            border-radius: 99px;
+            font-size: 12px;
+            font-weight: 500;
+            border: 1px solid var(--border);
+            background: var(--bg);
+            color: var(--text-secondary);
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+        
+        .filter-btn:hover,
+        .filter-btn.active {
+            border-color: var(--accent);
+            color: var(--accent);
+            background: var(--accent-light);
+        }
+        
+        .problem-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        
+        .problem-table th {
+            text-align: left;
+            padding: 12px 12px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            color: var(--text-muted);
+            border-bottom: 1px solid var(--border);
+        }
+        
+        .problem-table td {
+            padding: 12px;
+            font-size: 13px;
+            border-bottom: 1px solid var(--border-light);
+        }
+        
+        .problem-row:hover {
+            background: var(--bg-secondary);
+        }
+        
+        .problem-title-link {
+            color: var(--text-primary);
+            text-decoration: none;
+            font-weight: 500;
+        }
+        
+        .problem-title-link:hover {
+            color: var(--accent);
+        }
+        
+        .start-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 5px 12px;
+            border-radius: var(--radius-sm);
+            font-size: 12px;
+            font-weight: 500;
+            text-decoration: none;
+            background: var(--accent);
+            color: white;
+            transition: all 0.15s;
+            border: none;
+            cursor: pointer;
+        }
+        
+        .start-btn:hover {
+            background: var(--accent-hover);
+        }
+        
+        .start-btn.done {
+            background: var(--bg-tertiary);
+            color: var(--text-secondary);
+        }
+
+        .ide-wrapper {
+            display: flex;
+            flex: 1;
+            min-height: 0;
+            overflow: hidden;
+            width: 100%;
+        }
+
+        .ide-left {
+            width: 35%;
+            min-width: 300px;
+            max-width: 450px;
+            display: flex;
+            flex-direction: column;
+            border-right: 1px solid var(--border);
+            overflow: hidden;
+            background: var(--bg);
+        }
+
+        .ide-right {
+            flex: 1;
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .ide-left-tabs {
+            display: flex;
+            border-bottom: 1px solid var(--border);
+            background: var(--bg);
+            padding: 0 16px;
+            flex-shrink: 0;
+        }
+        
+        .ide-tab {
+            padding: 12px 20px;
+            font-size: 13px;
+            font-weight: 500;
+            color: var(--text-secondary);
+            border-bottom: 2px solid transparent;
+            cursor: pointer;
+            transition: all 0.15s;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .ide-tab:hover {
+            color: var(--text-primary);
+        }
+        
+        .ide-tab.active {
+            color: var(--text-primary);
+            border-bottom-color: var(--text-primary);
+        }
+        
+        .ide-left-body {
+            flex: 1;
+            overflow-y: auto;
+            overflow-x: hidden;
+            padding: 20px;
+        }
+
+        .problem-header h1 {
+            font-size: 20px;
+            font-weight: 700;
+            margin-bottom: 12px;
+        }
+        
+        .problem-header-meta {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+        
+        .problem-desc {
+            font-size: 14px;
+            line-height: 1.6;
+            margin-bottom: 24px;
+        }
+        
+        .problem-section-title {
+            font-size: 14px;
+            font-weight: 600;
+            margin: 20px 0 12px;
+        }
+        
+        .example-block {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 16px;
+            margin-bottom: 16px;
+        }
+        
+        .example-block pre {
+            font-family: var(--font-mono);
+            font-size: 12px;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        
+        .constraints-block {
+            background: var(--bg-secondary);
+            border-left: 3px solid var(--accent);
+            border-radius: var(--radius);
+            padding: 12px 16px;
+            font-size: 13px;
+            margin-bottom: 20px;
+        }
+        
+        .test-case-grid {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            margin-bottom: 20px;
+        }
+        
+        .tc-card {
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            overflow: hidden;
+        }
+        
+        .tc-card-header {
+            padding: 8px 12px;
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border);
+            font-size: 11px;
+            font-weight: 600;
+        }
+        
+        .tc-card-body {
+            padding: 12px;
+            font-family: var(--font-mono);
+            font-size: 12px;
+        }
+        
+        .ai-feedback-box {
+            background: linear-gradient(135deg, #eff6ff, #f0fdf4);
+            border: 1px solid var(--accent-border);
+            border-radius: var(--radius-lg);
+            padding: 16px;
+            margin-top: 20px;
+        }
+
+        .ide-right-toolbar {
+            height: 48px;
+            display: flex;
+            align-items: center;
+            padding: 0 16px;
+            gap: 12px;
+            border-bottom: 1px solid var(--border);
+            background: var(--bg);
+            flex-shrink: 0;
+        }
+        
+        .lang-select {
+            font-family: var(--font-sans);
+            font-size: 13px;
+            padding: 6px 28px 6px 10px;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            background: var(--bg);
+            cursor: pointer;
+            appearance: none;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%236b7280' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 8px center;
+        }
+        
+        .btn-run, .btn-submit, .btn-reset {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 14px;
+            border-radius: var(--radius-sm);
+            font-size: 12px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.15s;
+            border: 1px solid var(--border);
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+        }
+        
+        .btn-submit {
+            background: var(--green);
+            color: white;
+            border: none;
+        }
+        
+        .btn-submit:hover {
+            background: #15803d;
+        }
+        
+        .btn-run:hover {
+            background: var(--bg-tertiary);
+        }
+        
+        .btn-reset {
+            padding: 6px 10px;
+        }
+
+        .ide-editor-area {
+            flex: 1;
+            min-height: 0;
+            overflow: hidden;
+        }
+        
+        .CodeMirror {
+            height: 100% !important;
+            font-family: var(--font-mono) !important;
+            font-size: 13px !important;
+            line-height: 1.6 !important;
+        }
+        
+        .ide-editor-statusbar {
+            height: 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 12px;
+            border-top: 1px solid var(--border);
+            background: var(--bg-secondary);
+            font-size: 11px;
+            color: var(--text-muted);
+            flex-shrink: 0;
+        }
+
+        .ide-bottom {
+            height: 220px;
+            border-top: 1px solid var(--border);
+            display: flex;
+            flex-shrink: 0;
+        }
+        
+        .output-pane, .ai-pane {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        
+        .output-pane {
+            border-right: 1px solid var(--border);
+        }
+        
+        .ai-header-bar {
+            padding: 8px 16px;
+            border-bottom: 1px solid var(--border);
+            background: var(--bg-secondary);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-shrink: 0;
+        }
+        
+        .bottom-pane-body {
+            flex: 1;
+            overflow-y: auto;
+            padding: 12px 16px;
+            font-size: 13px;
+            font-family: var(--font-mono);
+        }
+        
+        .output-pre {
+            white-space: pre-wrap;
+            word-break: break-word;
+            margin: 0;
+        }
+        
+        .output-empty {
+            color: var(--text-muted);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .ide-qtabs {
+            display: flex;
+            overflow-x: auto;
+            border-bottom: 1px solid var(--border);
+            background: var(--bg);
+            padding: 0 12px;
+            flex-shrink: 0;
+        }
+        
+        .ide-qtabs::-webkit-scrollbar {
+            height: 3px;
+        }
+        
+        .ide-qtab {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 16px;
+            font-size: 12px;
+            font-weight: 500;
+            color: var(--text-secondary);
+            border-bottom: 2px solid transparent;
+            white-space: nowrap;
+            cursor: pointer;
+            text-decoration: none;
+        }
+        
+        .ide-qtab:hover {
+            color: var(--text-primary);
+        }
+        
+        .ide-qtab.active {
+            color: var(--accent);
+            border-bottom-color: var(--accent);
+        }
+        
+        .q-num {
+            width: 22px;
+            height: 22px;
+            border-radius: 50%;
+            background: var(--bg-tertiary);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 11px;
+            font-weight: 600;
+        }
+        
+        .ide-qtab.active .q-num {
+            background: var(--accent);
+            color: white;
+        }
+
+        .flash {
             position: fixed;
-            top: 20px;
-            right: 20px;
-            z-index: 1000;
-            animation: slideIn 0.3s ease-out;
+            top: 64px;
+            right: 24px;
+            z-index: 10000;
+            min-width: 280px;
+            max-width: 400px;
+            padding: 12px 16px;
+            border-radius: var(--radius);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 13px;
+            font-weight: 500;
+            animation: slideIn 0.25s ease-out;
+        }
+        
+        .flash-success {
+            background: var(--green-bg);
+            color: var(--green);
+            border: 1px solid var(--green-border);
+        }
+        
+        .flash-error {
+            background: var(--red-bg);
+            color: var(--red);
+            border: 1px solid var(--red-border);
+        }
+        
+        .flash-close {
+            margin-left: auto;
+            cursor: pointer;
+            opacity: 0.6;
         }
         
         @keyframes slideIn {
@@ -621,651 +1262,453 @@ unset($_SESSION['success_message'], $_SESSION['error_message']);
                 opacity: 1;
             }
         }
-        
-        /* CodeMirror Overrides */
-        .CodeMirror {
-            height: 100%;
-            font-size: 14px;
-            font-family: 'JetBrains Mono', 'Fira Code', monospace;
-        }
-        
-        /* Custom Scrollbar */
-        ::-webkit-scrollbar {
-            width: 6px;
-            height: 6px;
-        }
-        
-        ::-webkit-scrollbar-track {
-            background: #1e1e2e;
-        }
-        
-        ::-webkit-scrollbar-thumb {
-            background: #4a4a6a;
-            border-radius: 3px;
-        }
-        
-        ::-webkit-scrollbar-thumb:hover {
-            background: #6a6a8a;
-        }
-        
-        /* Difficulty Badges */
-        .badge-easy {
-            background: linear-gradient(135deg, #10b981, #059669);
-        }
-        
-        .badge-medium {
-            background: linear-gradient(135deg, #f59e0b, #d97706);
-        }
-        
-        .badge-hard {
-            background: linear-gradient(135deg, #ef4444, #dc2626);
-        }
-        
-        /* Loading Spinner */
-        .spinner {
-            border: 2px solid rgba(255, 255, 255, 0.3);
-            border-top-color: white;
-            border-radius: 50%;
-            width: 16px;
-            height: 16px;
-            animation: spin 0.6s linear infinite;
+
+        .loader {
             display: inline-block;
+            width: 12px;
+            height: 12px;
+            border: 2px solid var(--bg-tertiary);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            animation: spin 0.6s linear infinite;
         }
         
         @keyframes spin {
             to { transform: rotate(360deg); }
         }
-        
-        /* AI Feedback Animation */
-        .ai-pulse {
-            animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+
+        .empty-state {
+            text-align: center;
+            padding: 48px 24px;
         }
         
-        @keyframes pulse {
-            0%, 100% {
-                opacity: 1;
+        .empty-state-icon {
+            font-size: 48px;
+            margin-bottom: 16px;
+            color: var(--text-muted);
+        }
+        
+        @media (max-width: 768px) {
+            .ide-left {
+                width: 40%;
+                min-width: 260px;
             }
-            50% {
-                opacity: 0.5;
+            .dashboard-hero,
+            .dashboard-body {
+                padding: 20px;
             }
-        }
-        
-        /* Test Result Animations */
-        .test-pass {
-            animation: fadeIn 0.3s ease-out;
-        }
-        
-        .test-fail {
-            animation: shake 0.3s ease-out;
-        }
-        
-        @keyframes fadeIn {
-            from {
-                opacity: 0;
-                transform: translateY(-10px);
+            .qlist-header,
+            .qlist-body {
+                padding: 16px;
             }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
-        }
-        
-        @keyframes shake {
-            0%, 100% { transform: translateX(0); }
-            25% { transform: translateX(-5px); }
-            75% { transform: translateX(5px); }
-        }
-        
-        /* Button Hover Effects */
-        .btn-hover-effect {
-            transition: all 0.2s ease;
-        }
-        
-        .btn-hover-effect:hover {
-            transform: translateY(-2px);
-            filter: brightness(1.1);
-        }
-        
-        .btn-hover-effect:active {
-            transform: translateY(0);
         }
     </style>
 </head>
 <body>
 
-<!-- Flash Messages -->
-<?php if ($success_message): ?>
-<div class="flash-message" id="flashMessage">
-    <div class="bg-green-500/90 backdrop-blur-sm text-white px-6 py-4 rounded-2xl shadow-2xl flex items-center gap-3 border border-green-400/30">
-        <i class="fas fa-check-circle text-xl"></i>
-        <span class="font-medium"><?= htmlspecialchars($success_message) ?></span>
-        <button onclick="this.parentElement.parentElement.remove()" class="ml-4 text-white/70 hover:text-white transition">
-            <i class="fas fa-times"></i>
-        </button>
-    </div>
-</div>
-<?php endif; ?>
+<nav class="topnav">
+    <a href="index.php?page=programming_platform" class="topnav-logo">
+        <div class="logo-icon"><i class="fas fa-code"></i></div>
+        CodeLabs
+    </a>
+    <div class="topnav-divider"></div>
 
-<?php if ($error_message): ?>
-<div class="flash-message" id="flashMessage">
-    <div class="bg-red-500/90 backdrop-blur-sm text-white px-6 py-4 rounded-2xl shadow-2xl flex items-center gap-3 border border-red-400/30">
-        <i class="fas fa-exclamation-circle text-xl"></i>
-        <span class="font-medium"><?= htmlspecialchars($error_message) ?></span>
-        <button onclick="this.parentElement.parentElement.remove()" class="ml-4 text-white/70 hover:text-white transition">
-            <i class="fas fa-times"></i>
-        </button>
+    <?php if ($view_mode === 'ide' || $view_mode === 'question_list'): ?>
+    <div class="topnav-breadcrumb">
+        <a href="index.php?page=programming_platform">Labs</a>
+        <i class="fas fa-chevron-right" style="font-size: 10px; color: var(--text-muted);"></i>
+        <?php if ($view_mode === 'ide'): ?>
+            <a href="index.php?page=programming_platform&lab=<?= $selected_lab['id'] ?>"><?= htmlspecialchars($selected_lab['lab_name']) ?></a>
+            <i class="fas fa-chevron-right" style="font-size: 10px; color: var(--text-muted);"></i>
+            <span class="current"><?= htmlspecialchars($current_question['title']) ?></span>
+        <?php else: ?>
+            <span class="current"><?= htmlspecialchars($selected_lab['lab_name']) ?></span>
+        <?php endif; ?>
     </div>
-</div>
-<?php endif; ?>
+    <?php endif; ?>
 
-<?php if ($selected_lab && !empty($questions) && $current_question): ?>
-<!-- Main Coding Interface -->
-<div class="flex flex-col h-screen">
-    
-    <!-- Header -->
-    <header class="bg-gradient-to-r from-gray-900 to-gray-800 border-b border-gray-700/50 px-6 py-3 flex items-center justify-between flex-shrink-0">
-        <div class="flex items-center gap-4">
-            <a href="index.php?page=programming_platform" class="text-gray-400 hover:text-white transition-all duration-200 flex items-center gap-2 px-3 py-1.5 rounded-lg hover:bg-gray-700/50">
-                <i class="fas fa-arrow-left text-sm"></i>
-                <span class="text-sm font-medium">Back to Labs</span>
+    <div class="topnav-right">
+        <div class="topnav-stat">
+            <i class="fas fa-user-circle"></i>
+            <span><?= htmlspecialchars($user['full_name'] ?? 'Student') ?></span>
+        </div>
+    </div>
+</nav>
+
+<?php if ($view_mode === 'dashboard'): ?>
+<div class="dashboard-wrapper">
+    <div class="dashboard-hero">
+        <h1>Programming Labs</h1>
+        <p>Choose a lab to start solving coding challenges</p>
+        <div class="dashboard-stats">
+            <?php
+                $completed = count(array_filter($labs, fn($l) => ($l['progress_status']??'') === 'completed'));
+                $inprogress = count(array_filter($labs, fn($l) => ($l['progress_status']??'') === 'in_progress'));
+            ?>
+            <div class="stat-chip">
+                <div><div class="stat-val"><?= count($labs) ?></div><div class="stat-lbl">Total Labs</div></div>
+            </div>
+            <div class="stat-chip">
+                <div><div class="stat-val"><?= $completed ?></div><div class="stat-lbl">Completed</div></div>
+            </div>
+            <div class="stat-chip">
+                <div><div class="stat-val"><?= $inprogress ?></div><div class="stat-lbl">In Progress</div></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="dashboard-body">
+        <div class="section-title">Available Labs</div>
+        <?php if (empty($labs)): ?>
+        <div class="empty-state">
+            <div class="empty-state-icon"><i class="fas fa-folder-open"></i></div>
+            <h3>No Labs Available</h3>
+            <p>Please check back later or contact your instructor.</p>
+        </div>
+        <?php else: ?>
+        <div class="labs-grid">
+            <?php foreach ($labs as $lab):
+                $progress = $lab['progress'] ?? 0;
+                $status = $lab['progress_status'] ?? 'not_started';
+                $total = $lab['total_questions'] ?? 0;
+            ?>
+            <a href="index.php?page=programming_platform&lab=<?= $lab['id'] ?>" class="lab-card">
+                <div class="lab-card-header">
+                    <div class="lab-card-icon"><i class="fas fa-laptop-code"></i></div>
+                    <span class="badge <?= $status === 'completed' ? 'badge-easy' : ($status === 'in_progress' ? 'badge-medium' : 'badge-neutral') ?>">
+                        <?= ucfirst(str_replace('_', ' ', $status)) ?>
+                    </span>
+                </div>
+                <h3><?= htmlspecialchars($lab['lab_name']) ?></h3>
+                <p><?= htmlspecialchars(substr($lab['description'] ?? 'Start solving coding challenges.', 0, 100)) ?></p>
+                <div style="font-size: 12px; color: var(--text-muted); margin: 8px 0;">
+                    <strong><?= $total ?></strong> problems
+                </div>
+                <?php if ($status !== 'not_started'): ?>
+                <div class="progress-bar">
+                    <div class="progress-bar-fill" style="width:<?= $progress ?>%"></div>
+                </div>
+                <?php endif; ?>
+                <div class="lab-card-btn <?= $status === 'completed' ? 'secondary' : 'primary' ?>">
+                    <?= $status === 'completed' ? 'Review' : ($status === 'in_progress' ? 'Continue' : 'Start') ?>
+                </div>
             </a>
-            <div class="h-6 w-px bg-gray-600"></div>
-            <div>
-                <h1 class="text-white font-semibold text-lg flex items-center gap-2">
-                    <i class="fas fa-code text-indigo-400"></i>
-                    <?= htmlspecialchars($selected_lab['lab_name']) ?>
-                </h1>
-                <p class="text-gray-400 text-xs mt-0.5"><?= htmlspecialchars($selected_lab['description']) ?></p>
-            </div>
+            <?php endforeach; ?>
         </div>
-        <div class="flex items-center gap-3">
-            <div class="bg-gray-800/50 rounded-full px-4 py-1.5 border border-gray-700">
-                <span class="text-gray-400 text-xs">Progress</span>
-                <span class="text-white font-semibold text-sm ml-2"><?= count(array_filter($answers)) ?>/<?= count($questions) ?></span>
-            </div>
-        </div>
-    </header>
-    
-    <!-- Question Tabs -->
-    <div class="bg-gray-900/50 border-b border-gray-800 px-4 flex gap-1 overflow-x-auto flex-shrink-0">
-        <?php foreach ($questions as $i => $q):
-            $done = isset($answers[$q['id']]);
-            $active = ($q['id'] == $current_question['id']);
-        ?>
-        <a href="index.php?page=programming_platform&lab=<?= $selected_lab['id'] ?>&question=<?= $q['id'] ?>" 
-           class="px-5 py-2.5 text-sm font-medium transition-all duration-200 whitespace-nowrap relative
-                  <?= $active ? 'text-white' : 'text-gray-400 hover:text-gray-300' ?>">
-            <?= $i + 1 ?>. <?= htmlspecialchars($q['title']) ?>
-            <?php if ($done): ?>
-                <i class="fas fa-check-circle text-green-500 text-xs ml-1.5"></i>
-            <?php endif; ?>
-            <?php if ($active): ?>
-                <div class="absolute bottom-0 left-0 right-0 h-0.5 bg-indigo-500 rounded-full"></div>
-            <?php endif; ?>
-        </a>
-        <?php endforeach; ?>
+        <?php endif; ?>
     </div>
-    
-    <!-- Main Content Split View -->
-    <div class="flex-1 flex overflow-hidden">
-        
-        <!-- Left Panel - Question Details -->
-        <div class="w-2/5 bg-white overflow-y-auto border-r border-gray-200">
-            <div class="p-6">
-                <!-- Header with Difficulty -->
-                <div class="flex items-center justify-between mb-5">
-                    <span class="badge-<?= $current_question['difficulty'] ?> text-white text-xs font-bold px-3 py-1 rounded-full shadow-lg">
-                        <i class="fas fa-chart-line mr-1 text-xs"></i>
-                        <?= ucfirst($current_question['difficulty']) ?>
-                    </span>
-                    <span class="bg-indigo-50 text-indigo-700 text-xs font-semibold px-3 py-1 rounded-full border border-indigo-200">
-                        <i class="fas fa-code mr-1"></i>
-                        <?= ucfirst($current_question['language']) ?>
-                    </span>
-                </div>
-                
-                <!-- Title -->
-                <h2 class="text-2xl font-bold text-gray-900 mb-4"><?= htmlspecialchars($current_question['title']) ?></h2>
-                
-                <!-- Description -->
-                <div class="mb-6">
-                    <h3 class="text-sm font-semibold text-gray-700 uppercase tracking-wide mb-2 flex items-center gap-2">
-                        <i class="fas fa-book-open text-indigo-500 text-xs"></i>
-                        Problem Description
-                    </h3>
-                    <div class="text-gray-600 leading-relaxed text-sm space-y-2">
-                        <?= nl2br(htmlspecialchars($current_question['description'])) ?>
-                    </div>
-                </div>
-                
-                <!-- Examples -->
-                <?php if ($current_question['examples']): ?>
-                <div class="mb-6">
-                    <h3 class="text-sm font-semibold text-gray-700 uppercase tracking-wide mb-2 flex items-center gap-2">
-                        <i class="fas fa-lightbulb text-yellow-500 text-xs"></i>
-                        Examples
-                    </h3>
-                    <div class="bg-gray-900 rounded-xl p-4 font-mono text-sm">
-                        <?= nl2br(htmlspecialchars($current_question['examples'])) ?>
-                    </div>
-                </div>
-                <?php endif; ?>
-                
-                <!-- Constraints -->
-                <?php if ($current_question['constraints']): ?>
-                <div class="mb-6">
-                    <h3 class="text-sm font-semibold text-gray-700 uppercase tracking-wide mb-2 flex items-center gap-2">
-                        <i class="fas fa-chart-bar text-blue-500 text-xs"></i>
-                        Constraints
-                    </h3>
-                    <div class="bg-amber-50 border border-amber-200 rounded-xl p-4 text-sm text-amber-800">
-                        <?= nl2br(htmlspecialchars($current_question['constraints'])) ?>
-                    </div>
-                </div>
-                <?php endif; ?>
-                
-                <!-- Test Cases -->
-                <?php if ($current_question['test_cases']): 
-                    $test_cases = json_decode($current_question['test_cases'], true);
-                ?>
-                <div class="mb-6">
-                    <h3 class="text-sm font-semibold text-gray-700 uppercase tracking-wide mb-2 flex items-center gap-2">
-                        <i class="fas fa-vial text-green-500 text-xs"></i>
-                        Test Cases
-                    </h3>
-                    <div class="space-y-2">
-                        <?php foreach ($test_cases as $index => $test): ?>
-                        <div class="bg-gray-50 rounded-lg p-3 border border-gray-200">
-                            <div class="flex items-center justify-between text-sm">
-                                <span class="font-mono text-indigo-600 font-semibold">Test <?= $index + 1 ?></span>
-                                <span class="text-gray-500 text-xs">Input → Output</span>
-                            </div>
-                            <div class="font-mono text-sm mt-1">
-                                <span class="text-gray-700"><?= htmlspecialchars($test['input']) ?></span>
-                                <i class="fas fa-arrow-right text-gray-400 mx-2 text-xs"></i>
-                                <span class="text-green-600 font-semibold"><?= htmlspecialchars($test['expected_output']) ?></span>
-                            </div>
-                        </div>
-                        <?php endforeach; ?>
-                    </div>
-                </div>
-                <?php endif; ?>
-                
-                <!-- Submission AI Feedback -->
-                <?php if ($current_answer && !empty($current_answer['ai_feedback'])): ?>
-                <div class="mt-6 bg-gradient-to-r from-indigo-50 to-purple-50 rounded-xl p-4 border border-indigo-200">
-                    <div class="flex items-center gap-2 mb-2">
-                        <i class="fas fa-robot text-indigo-600"></i>
-                        <h3 class="font-semibold text-gray-800 text-sm">AI Feedback on Submission</h3>
-                    </div>
-                    <div class="text-sm text-gray-700 leading-relaxed">
-                        <?= nl2br(htmlspecialchars($current_answer['ai_feedback'])) ?>
-                    </div>
-                </div>
-                <?php endif; ?>
-            </div>
+</div>
+
+<?php elseif ($view_mode === 'question_list'): ?>
+<div class="qlist-wrapper">
+    <div class="qlist-header">
+        <h2><?= htmlspecialchars($selected_lab['lab_name']) ?></h2>
+        <p><?= htmlspecialchars($selected_lab['description'] ?? 'Complete all problems to master this topic.') ?></p>
+        <div style="margin-top: 12px; display: flex; gap: 12px;">
+            <span class="badge badge-neutral"><i class="fas fa-list"></i> <?= count($questions) ?> Problems</span>
+            <span class="badge badge-easy"><i class="fas fa-check-circle"></i> <?= count(array_filter($answers)) ?> Solved</span>
         </div>
-        
-        <!-- Right Panel - Code Editor -->
-        <div class="flex-1 flex flex-col bg-gray-900">
-            <!-- Toolbar -->
-            <div class="bg-gray-800 border-b border-gray-700 px-4 py-2 flex items-center justify-between flex-shrink-0">
-                <div class="flex items-center gap-3">
-                    <select id="language-select" class="bg-gray-700 text-white text-sm rounded-lg px-3 py-1.5 border border-gray-600 focus:outline-none focus:border-indigo-500 transition">
-                        <option value="python" <?= ($current_question['language'] ?? '') == 'python' ? 'selected' : '' ?>>🐍 Python</option>
-                        <option value="javascript" <?= ($current_question['language'] ?? '') == 'javascript' ? 'selected' : '' ?>>⚡ JavaScript</option>
-                        <option value="php" <?= ($current_question['language'] ?? '') == 'php' ? 'selected' : '' ?>>🐘 PHP</option>
-                    </select>
-                </div>
-                <div class="flex items-center gap-2">
-                    <button onclick="resetEditor()" class="bg-gray-700 hover:bg-gray-600 text-white text-sm px-3 py-1.5 rounded-lg transition flex items-center gap-2">
-                        <i class="fas fa-undo-alt text-xs"></i>
-                        Reset
-                    </button>
-                    <button onclick="runCode()" id="run-btn" class="bg-blue-600 hover:bg-blue-700 text-white text-sm px-4 py-1.5 rounded-lg transition flex items-center gap-2">
-                        <i class="fas fa-play text-xs"></i>
-                        Run
-                        <span class="text-xs opacity-75 ml-1">⌘↵</span>
-                    </button>
-                    <?php if (!$current_answer): ?>
-                    <button onclick="submitCode()" class="bg-green-600 hover:bg-green-700 text-white text-sm px-4 py-1.5 rounded-lg transition flex items-center gap-2">
-                        <i class="fas fa-paper-plane text-xs"></i>
-                        Submit
-                    </button>
-                    <?php else: ?>
-                    <div class="bg-green-500/20 text-green-400 text-sm px-3 py-1.5 rounded-lg flex items-center gap-2 border border-green-500/30">
-                        <i class="fas fa-check-circle"></i>
-                        Submitted • Score: <?= round($current_answer['score']) ?>%
-                    </div>
+    </div>
+
+    <div class="qlist-body">
+        <div class="filter-row">
+            <button class="filter-btn active" onclick="filterProblems('all', this)">All</button>
+            <button class="filter-btn" onclick="filterProblems('easy', this)">Easy</button>
+            <button class="filter-btn" onclick="filterProblems('medium', this)">Medium</button>
+            <button class="filter-btn" onclick="filterProblems('hard', this)">Hard</button>
+            <button class="filter-btn" onclick="filterProblems('unsolved', this)">Unsolved</button>
+        </div>
+
+        <table class="problem-table">
+            <thead>
+                <tr><th style="width: 40px"></th><th style="width: 50px">#</th><th>Title</th><th>Difficulty</th><th style="width: 100px">Action</th> </tr>
+            </thead>
+            <tbody>
+                <?php foreach ($questions as $i => $q):
+                    $solved = isset($answers[$q['id']]);
+                ?>
+                <tr class="problem-row" data-difficulty="<?= $q['difficulty'] ?>" data-solved="<?= $solved ? 'solved' : 'unsolved' ?>">
+                    <td><?= $solved ? '<i class="fas fa-check-circle" style="color: var(--green);"></i>' : '<i class="far fa-circle" style="color: var(--text-muted);"></i>' ?></td>
+                    <td style="color: var(--text-muted);"><?= $i + 1 ?></td>
+                    <td><a href="index.php?page=programming_platform&lab=<?= $selected_lab['id'] ?>&question=<?= $q['id'] ?>" class="problem-title-link"><?= htmlspecialchars($q['title']) ?></a></td>
+                    <td><span class="badge badge-<?= $q['difficulty'] ?>"><?= ucfirst($q['difficulty']) ?></span></td>
+                    <td><a href="index.php?page=programming_platform&lab=<?= $selected_lab['id'] ?>&question=<?= $q['id'] ?>" class="start-btn <?= $solved ? 'done' : '' ?>"><?= $solved ? 'Review' : 'Solve' ?></a></td>
+                </tr>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<script>
+function filterProblems(type, btn) {
+    document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    document.querySelectorAll('.problem-row').forEach(row => {
+        const diff = row.dataset.difficulty;
+        const solved = row.dataset.solved;
+        if (type === 'all') row.style.display = '';
+        else if (type === 'unsolved') row.style.display = solved === 'unsolved' ? '' : 'none';
+        else row.style.display = diff === type ? '' : 'none';
+    });
+}
+</script>
+
+<?php elseif ($view_mode === 'ide' && $current_question): ?>
+<div class="ide-wrapper">
+    <div class="ide-left">
+        <div class="ide-left-tabs">
+            <span class="ide-tab active" onclick="switchTab('description', this)">
+                <i class="fas fa-align-left"></i> Description
+            </span>
+            <span class="ide-tab" onclick="switchTab('submissions', this)">
+                <i class="fas fa-history"></i> Submissions
+            </span>
+        </div>
+
+        <div id="tab-description" class="ide-left-body">
+            <div class="problem-header">
+                <h1><?= htmlspecialchars($current_question['title']) ?></h1>
+                <div class="problem-header-meta">
+                    <span class="badge badge-<?= $current_question['difficulty'] ?>"><?= ucfirst($current_question['difficulty']) ?></span>
+                    <span class="badge badge-lang"><i class="fas fa-code"></i> <?= ucfirst($current_question['language'] ?? 'Python') ?></span>
+                    <?php if ($current_answer): ?>
+                    <span class="badge badge-easy"><i class="fas fa-check-circle"></i> Solved</span>
                     <?php endif; ?>
                 </div>
             </div>
+            <div class="problem-desc"><?= nl2br(htmlspecialchars($current_question['description'])) ?></div>
             
-            <!-- Code Editor -->
-            <div class="flex-1 overflow-hidden">
-                <textarea id="code-editor" class="w-full h-full"><?= $current_answer ? htmlspecialchars($current_answer['code']) : htmlspecialchars(getStarterCode($current_question['language'] ?? 'python')) ?></textarea>
-            </div>
+            <?php if ($current_question['examples']): ?>
+            <div class="problem-section-title">Examples</div>
+            <div class="example-block"><pre><?= htmlspecialchars($current_question['examples']) ?></pre></div>
+            <?php endif; ?>
             
-            <!-- Bottom Panels: Output + AI Review -->
-            <div class="h-64 border-t border-gray-700 flex flex-shrink-0">
-                <!-- Output Panel -->
-                <div class="w-1/2 flex flex-col border-r border-gray-700">
-                    <div class="bg-gray-800 px-4 py-1.5 text-xs font-semibold text-gray-400 uppercase tracking-wide flex items-center justify-between">
-                        <div class="flex items-center gap-2">
-                            <i class="fas fa-terminal"></i>
-                            <span>Output</span>
-                        </div>
-                        <button onclick="clearOutput()" class="text-gray-500 hover:text-gray-300 transition text-xs">
-                            <i class="fas fa-trash-alt"></i> Clear
-                        </button>
-                    </div>
-                    <div id="output" class="flex-1 overflow-y-auto p-3 font-mono text-sm bg-gray-950 text-green-400">
-                        <span class="text-gray-500">▶ Run your code to see output here...</span>
-                    </div>
-                </div>
-                
-                <!-- AI Review Panel -->
-                <div class="w-1/2 flex flex-col">
-                    <div class="bg-gradient-to-r from-indigo-600 to-purple-600 px-4 py-1.5 text-xs font-semibold text-white uppercase tracking-wide flex items-center gap-2">
-                        <i class="fas fa-robot"></i>
-                        <span>NVIDIA LLaMA · Live AI Review</span>
-                        <span id="ai-dot" class="ml-auto w-2 h-2 bg-green-400 rounded-full animate-pulse"></span>
-                    </div>
-                    <div id="ai-review" class="flex-1 overflow-y-auto p-3 text-sm bg-gray-900 text-gray-300 leading-relaxed">
-                        <span class="text-gray-500">✨ AI review will appear here after running your code...</span>
-                    </div>
-                </div>
+            <?php if ($current_question['constraints']): ?>
+            <div class="problem-section-title">Constraints</div>
+            <div class="constraints-block"><?= nl2br(htmlspecialchars($current_question['constraints'])) ?></div>
+            <?php endif; ?>
+            
+            <?php if ($current_answer && $current_answer['ai_feedback']): ?>
+            <div class="ai-feedback-box">
+                <strong><i class="fas fa-robot"></i> AI Feedback</strong>
+                <div style="margin-top: 8px;"><?= nl2br(htmlspecialchars($current_answer['ai_feedback'])) ?></div>
             </div>
+            <?php endif; ?>
         </div>
-    </div>
-</div>
 
-<?php else: ?>
-<!-- Labs List View -->
-<div class="min-h-screen bg-gradient-to-br from-gray-900 via-gray-800 to-gray-900">
-    <div class="container mx-auto px-6 py-12">
-        <div class="text-center mb-12">
-            <div class="inline-flex items-center justify-center w-20 h-20 bg-indigo-500/20 rounded-2xl mb-4">
-                <i class="fas fa-code text-4xl text-indigo-400"></i>
-            </div>
-            <h1 class="text-4xl font-bold text-white mb-2">Programming Labs</h1>
-            <p class="text-gray-400 text-lg">Select a lab to start your coding journey</p>
-        </div>
-        
-        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 max-w-7xl mx-auto">
-            <?php if (empty($labs)): ?>
-                <div class="col-span-full text-center py-16">
-                    <div class="bg-gray-800/50 backdrop-blur-sm rounded-2xl p-8 border border-gray-700">
-                        <i class="fas fa-database text-5xl text-yellow-500 mb-4"></i>
-                        <h3 class="text-xl font-bold text-white mb-2">No Labs Available</h3>
-                        <p class="text-gray-400">Please contact your instructor to create programming labs.</p>
-                    </div>
+        <div id="tab-submissions" class="ide-left-body" style="display: none;">
+            <?php if ($current_answer): ?>
+            <div style="background: var(--bg-secondary); border-radius: var(--radius); padding: 16px; margin-bottom: 16px;">
+                <div style="display: flex; justify-content: space-between; margin-bottom: 12px;">
+                    <span><strong>Score:</strong> <?= round($current_answer['score']) ?>%</span>
+                    <span><strong>Tests:</strong> <?= $current_answer['passed_tests'] ?>/<?= $current_answer['total_tests'] ?></span>
                 </div>
+                <div style="font-size: 12px; color: var(--text-muted);">Submitted: <?= date('M j, Y g:i A', strtotime($current_answer['submitted_at'])) ?></div>
+            </div>
+            <div><strong>Your Code:</strong></div>
+            <pre style="background: var(--bg-tertiary); padding: 12px; border-radius: var(--radius); overflow-x: auto; font-size: 12px; margin-top: 8px;"><?= htmlspecialchars($current_answer['code']) ?></pre>
             <?php else: ?>
-                <?php foreach ($labs as $lab): 
-                    $progress = $lab['progress'] ?? 0;
-                    $status = $lab['progress_status'] ?? 'not_started';
-                    $total = $lab['total_questions'] ?? 0;
-                ?>
-                    <div class="group bg-gray-800/50 backdrop-blur-sm rounded-2xl overflow-hidden border border-gray-700 hover:border-indigo-500 transition-all duration-300 hover:transform hover:scale-105">
-                        <div class="p-6">
-                            <div class="flex items-start justify-between mb-4">
-                                <div class="w-12 h-12 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-xl flex items-center justify-center shadow-lg">
-                                    <i class="fas fa-code text-white text-xl"></i>
-                                </div>
-                                <span class="px-3 py-1 rounded-full text-xs font-semibold
-                                    <?php 
-                                    if ($status == 'completed') echo 'bg-green-500/20 text-green-400 border border-green-500/30';
-                                    elseif ($status == 'in_progress') echo 'bg-yellow-500/20 text-yellow-400 border border-yellow-500/30';
-                                    else echo 'bg-gray-600/50 text-gray-400 border border-gray-600';
-                                    ?>">
-                                    <?= ucfirst(str_replace('_', ' ', $status)) ?>
-                                </span>
-                            </div>
-                            
-                            <h3 class="text-xl font-bold text-white mb-2 group-hover:text-indigo-400 transition"><?= htmlspecialchars($lab['lab_name']) ?></h3>
-                            <p class="text-gray-400 text-sm mb-4 line-clamp-2"><?= htmlspecialchars(substr($lab['description'] ?? '', 0, 100)) ?>...</p>
-                            
-                            <div class="space-y-3">
-                                <div class="flex justify-between text-sm">
-                                    <span class="text-gray-500">Problems:</span>
-                                    <span class="text-white font-semibold"><?= $total ?></span>
-                                </div>
-                                
-                                <?php if ($status != 'not_started'): ?>
-                                    <div>
-                                        <div class="flex justify-between text-sm mb-1">
-                                            <span class="text-gray-500">Progress:</span>
-                                            <span class="text-white font-semibold"><?= round($progress) ?>%</span>
-                                        </div>
-                                        <div class="w-full bg-gray-700 rounded-full h-2 overflow-hidden">
-                                            <div class="bg-gradient-to-r from-indigo-500 to-purple-600 h-2 rounded-full transition-all duration-500" style="width: <?= $progress ?>%"></div>
-                                        </div>
-                                    </div>
-                                <?php endif; ?>
-                            </div>
-                            
-                            <a href="index.php?page=programming_platform&lab=<?= $lab['id'] ?>" 
-                               class="mt-6 block w-full text-center px-4 py-2.5 rounded-xl font-semibold transition-all duration-200
-                                      <?= $status == 'completed' 
-                                          ? 'bg-green-600/20 text-green-400 border border-green-500/50 hover:bg-green-600/30' 
-                                          : 'bg-gradient-to-r from-indigo-600 to-purple-600 text-white hover:shadow-lg' ?>">
-                                <?php 
-                                if ($status == 'completed') echo '<i class="fas fa-redo mr-2"></i>Review';
-                                elseif ($status == 'in_progress') echo '<i class="fas fa-play mr-2"></i>Continue';
-                                else echo '<i class="fas fa-play mr-2"></i>Start Coding';
-                                ?>
-                            </a>
-                        </div>
-                    </div>
-                <?php endforeach; ?>
+            <div class="empty-state"><div class="empty-state-icon"><i class="fas fa-code-branch"></i></div><h3>No submissions yet</h3><p>Write and submit your solution</p></div>
             <?php endif; ?>
         </div>
     </div>
+
+    <div class="ide-right">
+        <div class="ide-qtabs">
+            <?php foreach ($questions as $i => $q): ?>
+            <a href="index.php?page=programming_platform&lab=<?= $selected_lab['id'] ?>&question=<?= $q['id'] ?>" class="ide-qtab <?= $q['id'] == $current_question['id'] ? 'active' : '' ?>">
+                <span class="q-num"><?= $i + 1 ?></span>
+                <span><?= htmlspecialchars($q['title']) ?></span>
+                <?php if (isset($answers[$q['id']])): ?><i class="fas fa-check" style="color: var(--green); font-size: 10px;"></i><?php endif; ?>
+            </a>
+            <?php endforeach; ?>
+        </div>
+
+        <div class="ide-right-toolbar">
+            <select id="language-select" class="lang-select">
+                <option value="python" <?= ($current_question['language']??'') == 'python' ? 'selected' : '' ?>>Python</option>
+                <option value="javascript" <?= ($current_question['language']??'') == 'javascript' ? 'selected' : '' ?>>JavaScript</option>
+                <option value="php" <?= ($current_question['language']??'') == 'php' ? 'selected' : '' ?>>PHP</option>
+            </select>
+            <button class="btn-reset" onclick="resetEditor()" title="Reset"><i class="fas fa-undo-alt"></i></button>
+            <button onclick="runCode()" id="run-btn" class="btn-run"><i class="fas fa-play"></i> Run</button>
+            <?php if (!$current_answer): ?>
+            <button onclick="submitCode()" class="btn-submit"><i class="fas fa-paper-plane"></i> Submit</button>
+            <?php else: ?>
+            <span class="badge badge-easy"><i class="fas fa-check"></i> Completed</span>
+            <?php endif; ?>
+        </div>
+
+        <div class="ide-editor-area">
+            <textarea id="code-editor"><?= $current_answer ? htmlspecialchars($current_answer['code']) : htmlspecialchars(getStarterCode($current_question['language'] ?? 'python')) ?></textarea>
+        </div>
+
+        <div class="ide-editor-statusbar">
+            <span id="cursor-pos">Ln 1, Col 1</span>
+            <span>Ctrl + Enter to Run</span>
+        </div>
+
+        <div class="ide-bottom">
+            <div class="output-pane">
+                <div class="ai-header-bar"><i class="fas fa-terminal"></i> Output</div>
+                <div id="output" class="bottom-pane-body"><span class="output-empty"><i class="fas fa-play"></i> Run your code</span></div>
+            </div>
+            <div class="ai-pane">
+                <div class="ai-header-bar"><i class="fas fa-robot"></i> AI Review</div>
+                <div id="ai-review" class="bottom-pane-body"><span class="output-empty"><i class="fas fa-sparkles"></i> Review appears after running</span></div>
+            </div>
+        </div>
+    </div>
 </div>
-<?php endif; ?>
 
 <script>
-// Initialize CodeMirror
 let editor = CodeMirror.fromTextArea(document.getElementById('code-editor'), {
     lineNumbers: true,
-    mode: 'python',
-    theme: 'dracula',
+    mode: '<?= $current_question['language'] ?? 'python' ?>',
     autoCloseBrackets: true,
     matchBrackets: true,
     indentUnit: 4,
     tabSize: 4,
-    lineWrapping: true,
-    gutters: ["CodeMirror-linenumbers"]
+    lineWrapping: true
+});
+
+editor.on('cursorActivity', function() {
+    let pos = editor.getCursor();
+    document.getElementById('cursor-pos').textContent = `Ln ${pos.line+1}, Col ${pos.ch+1}`;
 });
 
 let currentQuestionId = <?= $current_question['id'] ?? 0 ?>;
 let currentLanguage = '<?= $current_question['language'] ?? 'python' ?>';
 
-// Language selector
 document.getElementById('language-select').addEventListener('change', function() {
-    const language = this.value;
-    currentLanguage = language;
-    
-    let mode = 'python';
-    switch(language) {
-        case 'python': mode = 'python'; break;
-        case 'javascript': mode = 'javascript'; break;
-        case 'php': mode = 'php'; break;
-    }
-    
-    editor.setOption('mode', mode);
+    currentLanguage = this.value;
+    let modeMap = { python: 'python', javascript: 'javascript', php: 'php' };
+    editor.setOption('mode', modeMap[currentLanguage] || 'python');
 });
 
-// Reset editor to starter code
 function resetEditor() {
-    if (confirm('Reset to starter code? Your current code will be lost.')) {
-        const starters = {
-            'python': '# Write your solution here\n\ndef solution():\n    # your code here\n    pass\n\n# Example:\n# print(solution())\n',
-            'javascript': '// Write your solution here\n\nfunction solution() {\n    // your code here\n}\n\n// console.log(solution());\n',
-            'php': '<?php\n// Write your solution here\n\nfunction solution() {\n    // your code here\n}\n\n// echo solution();\n?>'
-        };
-        editor.setValue(starters[currentLanguage] || '# Write your code here\n');
-    }
+    if (!confirm('Reset to starter code?')) return;
+    let starters = {
+        python: '# Write your solution here\n\ndef solution(a, b):\n    return a + b\n',
+        javascript: '// Write your solution here\n\nfunction solution(a, b) {\n    return a + b;\n}\n',
+        php: '<?php\nfunction solution($a, $b) {\n    return $a + $b;\n}\n'
+    };
+    editor.setValue(starters[currentLanguage] || '# Write your code here');
 }
 
-// Run code
 async function runCode() {
-    const code = editor.getValue();
-    const output = document.getElementById('output');
-    const runBtn = document.getElementById('run-btn');
-    const aiReview = document.getElementById('ai-review');
+    let code = editor.getValue();
+    let outputDiv = document.getElementById('output');
+    let aiDiv = document.getElementById('ai-review');
+    let runBtn = document.getElementById('run-btn');
     
     runBtn.disabled = true;
-    runBtn.innerHTML = '<div class="spinner mr-2"></div>Running...';
-    output.innerHTML = '<div class="text-yellow-400"><div class="spinner mr-2"></div>Executing code...</div>';
-    aiReview.innerHTML = '<div class="text-purple-400"><div class="spinner mr-2"></div>AI is analyzing your code...</div>';
+    runBtn.innerHTML = '<div class="loader"></div> Running';
+    outputDiv.innerHTML = '<span class="output-empty"><div class="loader"></div> Executing...</span>';
+    aiDiv.innerHTML = '<span class="output-empty"><div class="loader"></div> Analyzing...</span>';
     
     try {
-        // Execute code
-        const execResponse = await fetch(window.location.href, {
+        let execResp = await fetch(window.location.href, {
             method: 'POST',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: new URLSearchParams({
-                'execute_code': '1',
-                'code': code,
-                'language': currentLanguage
-            })
+            body: new URLSearchParams({ execute_code: '1', code: code, language: currentLanguage })
         });
+        let execText = await execResp.text();
+console.log(execText); // debug
+
+let execData;
+try {
+    execData = JSON.parse(execText);
+} catch (e) {
+    throw new Error("Invalid JSON response from server");
+}
+        let runOutput = execData.success ? (execData.output || '(no output)') : ('Error: ' + (execData.error || 'Unknown'));
+        outputDiv.innerHTML = `<pre class="output-pre">${escapeHtml(runOutput)}</pre>`;
         
-        const execData = await execResponse.json();
-        const runOutput = execData.success ? (execData.output || '(no output)') : ('Error: ' + (execData.error || 'Unknown'));
-        
-        if (execData.success) {
-            output.innerHTML = `<pre class="text-green-400 whitespace-pre-wrap break-words">${escapeHtml(runOutput)}</pre>`;
-        } else {
-            output.innerHTML = `<pre class="text-red-400 whitespace-pre-wrap break-words">${escapeHtml(runOutput)}</pre>`;
-        }
-        
-        // Get AI review
-        const aiResponse = await fetch(window.location.href, {
+        let aiResp = await fetch(window.location.href, {
             method: 'POST',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: new URLSearchParams({
-                'ai_review': '1',
-                'code': code,
-                'language': currentLanguage,
-                'question_id': currentQuestionId,
-                'run_output': runOutput
-            })
+            body: new URLSearchParams({ ai_review: '1', code: code, language: currentLanguage, question_id: currentQuestionId, run_output: runOutput })
         });
-        
-        const aiData = await aiResponse.json();
-        
+        let aiText = await aiResp.text();
+
+let aiData;
+try {
+    aiData = JSON.parse(aiText);
+} catch (e) {
+    throw new Error("Invalid JSON response from server");
+}
         if (aiData.success) {
-            aiReview.innerHTML = formatAIReview(aiData.review);
+            aiDiv.innerHTML = `<div style="white-space: pre-wrap;">${escapeHtml(aiData.review).replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>').replace(/\n/g, '<br>')}</div>`;
         } else {
-            aiReview.innerHTML = `<div class="text-red-400">Error: ${escapeHtml(aiData.error)}</div>`;
+            aiDiv.innerHTML = `<span style="color: var(--red);">Error: ${escapeHtml(aiData.error)}</span>`;
         }
-        
-    } catch (error) {
-        output.innerHTML = `<div class="text-red-400">Error: ${escapeHtml(error.message)}</div>`;
-        aiReview.innerHTML = `<div class="text-red-400">Failed to get AI review: ${escapeHtml(error.message)}</div>`;
+    } catch (err) {
+        console.error('Error:', err);
+        outputDiv.innerHTML = `<span style="color: var(--red);">Network error: ${err.message}</span>`;
+        aiDiv.innerHTML = `<span style="color: var(--red);">Failed to get review</span>`;
     } finally {
         runBtn.disabled = false;
-        runBtn.innerHTML = '<i class="fas fa-play text-xs"></i> Run <span class="text-xs opacity-75 ml-1">⌘↵</span>';
+        runBtn.innerHTML = '<i class="fas fa-play"></i> Run';
     }
 }
 
-// Format AI review with better styling
-function formatAIReview(text) {
-    let formatted = escapeHtml(text)
-        .replace(/\*\*(.+?)\*\*/g, '<strong class="text-indigo-300">$1</strong>')
-        .replace(/`([^`]+)`/g, '<code class="bg-gray-800 text-indigo-300 px-1 py-0.5 rounded text-xs">$1</code>')
-        .replace(/^(\d+\.\s+)/gm, '<span class="text-indigo-400 font-bold">$1</span>')
-        .replace(/\n/g, '<br>');
-    
-    return `<div class="text-sm leading-relaxed space-y-2">${formatted}</div>`;
-}
-
-// Submit code
 function submitCode() {
-    if (!confirm('Are you sure you want to submit your code? This action cannot be undone.')) {
-        return;
-    }
-    
-    const code = editor.getValue();
-    const form = document.createElement('form');
+    if (!confirm('Submit your solution?')) return;
+    let form = document.createElement('form');
     form.method = 'POST';
     form.action = window.location.href;
-    
-    const fields = {
-        'submit_programming_answer': '1',
-        'question_id': currentQuestionId,
-        'lab_id': '<?= $_GET['lab'] ?? '' ?>',
-        'code': code,
-        'language': currentLanguage
+    let fields = {
+        submit_programming_answer: '1',
+        question_id: currentQuestionId,
+        lab_id: '<?= $_GET['lab'] ?? '' ?>',
+        code: editor.getValue(),
+        language: currentLanguage
     };
-    
-    for (const key in fields) {
-        const input = document.createElement('input');
+    for (let key in fields) {
+        let input = document.createElement('input');
         input.type = 'hidden';
         input.name = key;
         input.value = fields[key];
         form.appendChild(input);
     }
-    
     document.body.appendChild(form);
     form.submit();
 }
 
-// Clear output
-function clearOutput() {
-    document.getElementById('output').innerHTML = '<span class="text-gray-500">▶ Run your code to see output here...</span>';
+function switchTab(tab, el) {
+    document.querySelectorAll('.ide-tab').forEach(t => t.classList.remove('active'));
+    el.classList.add('active');
+    document.getElementById('tab-description').style.display = tab === 'description' ? 'block' : 'none';
+    document.getElementById('tab-submissions').style.display = tab === 'submissions' ? 'block' : 'none';
 }
 
-// Escape HTML
-function escapeHtml(unsafe) {
-    if (!unsafe) return '';
-    return unsafe
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;")
-        .replace(/'/g, "&#039;");
+function escapeHtml(str) {
+    if (!str) return '';
+    return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-// Auto-dismiss flash message after 5 seconds
-const flashMessage = document.getElementById('flashMessage');
-if (flashMessage) {
-    setTimeout(() => {
-        flashMessage.style.animation = 'slideOut 0.3s ease-out forwards';
-        setTimeout(() => flashMessage.remove(), 300);
-    }, 5000);
-}
-
-// Keyboard shortcuts
 document.addEventListener('keydown', function(e) {
-    // Ctrl+Enter to run code
     if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
         e.preventDefault();
         runCode();
     }
-    // Ctrl+Shift+Enter to submit
-    if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'Enter') {
-        e.preventDefault();
-        submitCode();
-    }
 });
-</script>
 
-<style>
-@keyframes slideOut {
-    from {
-        transform: translateX(0);
-        opacity: 1;
-    }
-    to {
-        transform: translateX(100%);
-        opacity: 0;
-    }
-}
-</style>
+setTimeout(() => {
+    let flash = document.querySelector('.flash');
+    if (flash) flash.remove();
+}, 5000);
+</script>
+<?php endif; ?>
+
+<?php if ($success_message): ?>
+<div class="flash flash-success"><i class="fas fa-check-circle"></i><span><?= htmlspecialchars($success_message) ?></span><span class="flash-close" onclick="this.parentElement.remove()">×</span></div>
+<?php endif; ?>
+<?php if ($error_message): ?>
+<div class="flash flash-error"><i class="fas fa-exclamation-circle"></i><span><?= htmlspecialchars($error_message) ?></span><span class="flash-close" onclick="this.parentElement.remove()">×</span></div>
+<?php endif; ?>
 
 </body>
 </html>

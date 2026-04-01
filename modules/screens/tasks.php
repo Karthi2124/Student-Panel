@@ -8,48 +8,55 @@ if (session_status() === PHP_SESSION_NONE) {
 
 require_once __DIR__ . '/../../config/database.php';
 
-// ✅ Get logged user
-$user_id = $_SESSION['user_id'] ?? $_SESSION['student_id'] ?? 0;
+// ✅ STEP 1: Check login (student)
+$user_id = $_SESSION['student_id'] ?? 0;
 
-// ✅ Filter (All / Pending / Completed)
-$filter = $_GET['status'] ?? 'all';
+if (!$user_id) {
+    $user = null;
+    $tasks = [];
+} else {
 
-$tasks = [];
-
-if ($user_id) {
-
-    // ✅ Get student details
-    $stmtUser = $pdo->prepare("SELECT id, year, department FROM users WHERE id = ?");
+    // ✅ STEP 2: Get user details (from users table)
+    $stmtUser = $pdo->prepare("
+        SELECT id, full_name AS name, department, year, email 
+        FROM users 
+        WHERE id = ?
+    ");
     $stmtUser->execute([$user_id]);
-    $user = $stmtUser->fetch();
+    $user = $stmtUser->fetch(PDO::FETCH_ASSOC);
 
-    if ($user) {
+    // ✅ STEP 3: Get student table ID
+    $stmtStudent = $pdo->prepare("SELECT id FROM students WHERE user_id = ?");
+    $stmtStudent->execute([$user_id]);
+    $student = $stmtStudent->fetch(PDO::FETCH_ASSOC);
 
+    $student_id = $student['id'] ?? 0;
+
+    // ✅ STEP 4: Get tasks
+    $tasks = [];
+
+    if ($student_id) {
         $query = "
             SELECT 
                 t.id,
                 t.title,
                 t.description,
                 t.deadline,
-                ta.status
+                t.year,
+                t.department,
+                ta.id AS assignment_id,
+                ta.status,
+                ta.assigned_at,
+                ta.marks,
+                ta.submission_file
             FROM task_assignments ta
-            JOIN tasks t ON t.id = ta.task_id
+            INNER JOIN tasks t ON t.id = ta.task_id
             WHERE ta.student_id = ?
-            AND (t.year = ? OR t.year IS NULL)
+            ORDER BY t.deadline ASC
         ";
 
-        $params = [$user_id, $user['year']];
-
-        // ✅ Apply filter
-        if ($filter !== 'all') {
-            $query .= " AND ta.status = ?";
-            $params[] = $filter;
-        }
-
-        $query .= " ORDER BY t.deadline ASC";
-
         $stmt = $pdo->prepare($query);
-        $stmt->execute($params);
+        $stmt->execute([$student_id]);
         $tasks = $stmt->fetchAll(PDO::FETCH_ASSOC);
     }
 }
@@ -61,125 +68,70 @@ if ($user_id) {
     <title>My Tasks</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
+
 <body class="bg-[#f6f9fc]">
 
 <div class="max-w-6xl mx-auto py-10 px-4">
 
-    <!-- HEADER -->
-    <div class="flex justify-between items-center mb-8">
-        <h1 class="text-3xl font-bold text-gray-800">My Tasks</h1>
+    <h1 class="text-3xl font-bold mb-4">My Tasks</h1>
 
-        <!-- FILTER -->
-        <div class="flex gap-2">
-            <a href="?status=all"
-               class="px-4 py-2 rounded-lg border <?= $filter=='all'?'bg-blue-600 text-white':'bg-white' ?>">
-               All
-            </a>
+    <?php if ($user): ?>
+        <p class="mb-6 text-gray-600">
+            Welcome, <?= htmlspecialchars($user['name']) ?> |
+            Year: <?= htmlspecialchars($user['year'] ?? 'Not set') ?> |
+            Department: <?= htmlspecialchars($user['department']) ?>
+        </p>
+    <?php endif; ?>
 
-            <a href="?status=pending"
-               class="px-4 py-2 rounded-lg border <?= $filter=='pending'?'bg-yellow-500 text-white':'bg-white' ?>">
-               Pending
-            </a>
-
-            <a href="?status=completed"
-               class="px-4 py-2 rounded-lg border <?= $filter=='completed'?'bg-green-600 text-white':'bg-white' ?>">
-               Completed
-            </a>
-        </div>
-    </div>
-
-    <!-- TASK GRID -->
+    <!-- TASK LIST -->
     <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
 
         <?php if (!empty($tasks)): ?>
+
             <?php foreach ($tasks as $task): ?>
+                <div class="bg-white p-6 rounded-xl shadow">
 
-            <div class="bg-white rounded-xl shadow-sm border p-6 hover:shadow-md transition">
+                    <h2 class="text-lg font-semibold mb-2">
+                        <?= htmlspecialchars($task['title']) ?>
+                    </h2>
 
-                <!-- TITLE -->
-                <h2 class="text-lg font-semibold text-gray-800 mb-2">
-                    <?= htmlspecialchars($task['title']) ?>
-                </h2>
+                    <p class="text-sm text-gray-600 mb-3">
+                        <?= htmlspecialchars(substr($task['description'], 0, 120)) ?>
+                    </p>
 
-                <!-- DESCRIPTION -->
-                <p class="text-gray-600 text-sm mb-4">
-                    <?= htmlspecialchars($task['description']) ?>
-                </p>
+                    <p class="text-sm mb-2">
+                        📅 Deadline: <?= date('M d, Y', strtotime($task['deadline'])) ?>
+                    </p>
 
-                <!-- DEADLINE -->
-                <div class="text-sm text-gray-500 mb-4">
-                    📅 Deadline: <?= $task['deadline'] ?>
-                </div>
-
-                <!-- STATUS + BUTTON -->
-                <div class="flex justify-between items-center">
-
-                    <!-- STATUS -->
-                    <span class="px-3 py-1 rounded-full text-xs font-semibold
-                        <?= $task['status']=='pending'
-                            ? 'bg-yellow-100 text-yellow-700'
-                            : 'bg-green-100 text-green-700' ?>">
-                        <?= ucfirst($task['status']) ?>
-                    </span>
-
-                    <!-- ACTION -->
-                    <?php if ($task['status'] == 'pending'): ?>
-                        <a href="submit_task.php?id=<?= $task['id'] ?>"
-                           class="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700">
-                           Submit
-                        </a>
-                    <?php else: ?>
-                        <span class="text-green-600 text-sm font-medium">
-                            ✔ Completed
+                    <p class="text-sm mb-4">
+                        Status:
+                        <span class="font-semibold text-blue-600">
+                            <?= ucfirst($task['status'] ?? 'pending') ?>
                         </span>
+                    </p>
+
+                    <?php if (($task['status'] ?? 'pending') == 'pending'): ?>
+<a href="index.php?page=task_details&task_id=<?= $task['id'] ?>&assignment_id=<?= $task['assignment_id'] ?>"
+   class="px-4 py-2 bg-green-600 text-white rounded">
+   Start Task
+</a>
                     <?php endif; ?>
 
                 </div>
-
-            </div>
-
             <?php endforeach; ?>
 
         <?php else: ?>
 
-            <!-- EMPTY -->
-            <div class="col-span-2 text-center py-16 text-gray-500">
-                No tasks available
+            <div class="col-span-2 text-center py-16">
+                <h3 class="text-xl font-semibold mb-2">No tasks available</h3>
+                <p class="text-gray-400">You don't have any assigned tasks.</p>
+
+                <?php if (!$user): ?>
+                    <p class="text-red-500 mt-4">⚠️ Please log in</p>
+                <?php endif; ?>
             </div>
 
         <?php endif; ?>
-
-    </div>
-
-    <!-- STATS -->
-    <div class="mt-10 bg-white rounded-xl shadow-sm border p-6">
-
-        <h3 class="text-lg font-semibold mb-4">Task Statistics</h3>
-
-        <div class="grid grid-cols-3 text-center">
-
-            <div>
-                <div class="text-2xl font-bold text-blue-600">
-                    <?= count($tasks) ?>
-                </div>
-                <div class="text-sm text-gray-500">Total</div>
-            </div>
-
-            <div>
-                <div class="text-2xl font-bold text-yellow-500">
-                    <?= count(array_filter($tasks, fn($t)=>$t['status']=='pending')) ?>
-                </div>
-                <div class="text-sm text-gray-500">Pending</div>
-            </div>
-
-            <div>
-                <div class="text-2xl font-bold text-green-600">
-                    <?= count(array_filter($tasks, fn($t)=>$t['status']=='completed')) ?>
-                </div>
-                <div class="text-sm text-gray-500">Completed</div>
-            </div>
-
-        </div>
 
     </div>
 
